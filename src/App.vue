@@ -10,12 +10,12 @@
     <section v-else id="table-container">
       <table id="table">
         <tr>
-          <th v-for="field of fields" :key="field.name">
-            {{ field.name }} ({{ field.type }})
-          </th>
+          <th v-for="column of shownColumns" :key="column">{{ column.name }}</th>
         </tr>
         <tr v-for="(row, i) in data" :key="i">
-          <td v-for="field of fields" :key="`${i}_${field.name}`">{{ row.properties[field.name] }}</td>
+          <td v-for="j of shownColumnsIndices" :key="`${i}_${j}`">
+            {{ row[j] }}
+          </td>
         </tr>
       </table>
     </section>
@@ -23,11 +23,10 @@
   </main>
   <footer id="footer">
     <span>
-      Powered by 
+      Powered by
       <a href="https://vuejs.org" target="_blank">Vue</a>,
-      <a href="https://openlayers.org" target="_blank">OpenLayers</a>,
-      <a href="https://github.com/kylebarron/parquet-wasm" target="_blank">parquet-wasm</a>,
-      and <a href="https://loaders.gl" target="_blank">loaders.gl</a>
+      <a href="https://openlayers.org" target="_blank">OpenLayers</a>, and
+      <a href="https://github.com/hyparam/hyparquet" target="_blank">hyparquet</a>
     </span>
     <span>Hosted by <a href="https://github.com" target="_blank">GitHub</a></span>
     <span>Assembled by <a href="https://mohr.ws" target="_blank">Matthias Mohr</a></span>
@@ -35,18 +34,24 @@
 </template>
 
 <script>
-import {ParquetLoader} from '@loaders.gl/parquet';
-import {loadInBatches} from '@loaders.gl/core';
+import { parquetRead, parquetMetadataAsync, parquetSchema } from 'hyparquet';
+import { compressors as hycompressors } from 'hyparquet-compressors';
+import { snappyUncompressor } from 'hysnappy';
 
-import GeoJSON from 'ol/format/GeoJSON.js';
+import WKB from 'ol/format/WKB.js';
 import Map from 'ol/Map.js';
 import View from 'ol/View.js';
-import {OSM, Vector as VectorSource} from 'ol/source.js';
-import {Tile as TileLayer, Vector as VectorLayer} from 'ol/layer.js';
+import { OSM, Vector as VectorSource } from 'ol/source.js';
+import { Tile as TileLayer, Vector as VectorLayer } from 'ol/layer.js';
 import proj4 from 'proj4';
-import {register} from 'ol/proj/proj4.js';
+import { register } from 'ol/proj/proj4.js';
 
 register(proj4); // required to support reprojection
+
+const compressors = {
+  ...hycompressors,
+  snappy: snappyUncompressor()
+};
 
 export default {
   name: 'App',
@@ -54,19 +59,61 @@ export default {
     return {
       source: new VectorSource(),
       map: null,
-      fields: [],
+      columns: [],
       data: [],
-      url: 'https://raw.githubusercontent.com/visgl/loaders.gl/master/modules/parquet/test/data/geoparquet/airports.parquet',
-      options: {
-        worker: false,
-        parquet: {
-          shape: 'geojson-table',
-          preserveBinary: true
-        }
-      }
-    }
+      url: './airports.parquet',
+      rowStart: 0,
+      rowEnd: 1000,
+      fileSize: null,
+      metadata: null
+    };
   },
   computed: {
+    asyncBuffer() {
+      return {
+        byteLength: this.fileSize,
+        slice: async (start, end) => {
+          const rangeEnd = end === undefined ? '' : end - 1;
+          const res = await fetch(this.url, {
+            headers: {
+              Range: `bytes=${start}-${rangeEnd}`
+            }
+          });
+          return res.arrayBuffer();
+        }
+      };
+    },
+    geoMetadata() {
+      const geo = this.metadata?.key_value_metadata?.find(md => md.key === 'geo');
+      if (geo && geo.value) {
+        return JSON.parse(geo.value);
+      }
+      return null;
+    },
+    schema() {
+      return parquetSchema(this.metadata);
+    },
+    allColumns() {
+      const map = {};
+      for (const index in this.schema.children) {
+        const child = this.schema.children[index];
+        map[child.element.name] = parseInt(index, 10);
+      }
+      return map;
+    },
+    sortedColumns() {
+      return Object.entries(this.allColumns)
+        .sort((a, b) => (a[1] - b[1]))
+        .map(x => ({index: x[1], name: x[0]}));
+    },
+    shownColumns() {
+      return this.sortedColumns
+        .filter(x => !(x.name in this.geoMetadata.columns));
+    },
+    shownColumnsIndices() {
+      return this.shownColumns
+        .map(x => x.index);
+    }
   },
   watch: {
     url() {
@@ -80,7 +127,11 @@ export default {
   methods: {
     reset() {
       this.data = [];
-      this.fields = [];
+      this.columns = [];
+      this.rowStart = 0;
+      this.rowEnd = 1000;
+      this.fileSize = null;
+      this.metadata = null;
       this.source.clear();
     },
     showLoad() {
@@ -89,31 +140,77 @@ export default {
         this.url = url;
       }
     },
-    async load() {
+    async discover() {
       this.reset();
-      const geojson = new GeoJSON();
       try {
-        const batches = await loadInBatches(this.url, ParquetLoader, this.options);
-        for await (const batch of batches) {
-          if (this.fields.length === 0) {
-            this.fields = batch.data.schema.fields.filter(field => !field.name.startsWith('geo')); // todo
-          }
-          this.data = this.data.concat(batch.data.features);
-          for (const feature of batch.data.features) {
-            try {
-              const olFeature = geojson.readFeature(feature, {
-                dataProjection: 'EPSG:4326',
-                featureProjection: 'EPSG:3857',
-              });
-              this.source.addFeature(olFeature);
-            } catch (error) {
-              console.error(error);
-            }
-          }
+        const head = await fetch(this.url, { method: 'HEAD' });
+        if (!head.ok) {
+          throw new Error(`Error (${head.status}) fetching file: ${head.statusText}`);
+        }
+        const size = head.headers.get('content-length');
+        if (!size) {
+          throw new Error('No content-length header returned by server');
+        }
+        this.fileSize = Number(size);
+        this.metadata = await parquetMetadataAsync(this.asyncBuffer);
+        if (this.columns.length === 0) {
+          this.columns = Object.keys(this.allColumns)//.filter(col => !(col in this.geoMetadata.columns));
         }
       } catch (error) {
-        alert(error.message);
+        this.showError(error.message);
       }
+    },
+    async load() {
+      await this.discover();
+      try {
+        await parquetRead({
+          file: this.asyncBuffer,
+          metadata: this.metadata,
+          compressors,
+          columns: this.columns.length === 0 ? undefined : this.columns,
+          rowStart: this.rowStart,
+          rowEnd: this.rowEnd,
+          onComplete: (data) => (this.data = data)
+        });
+        await this.parseWKB();
+        await this.addToMap();
+        console.log(this.geoMetadata);
+      } catch (error) {
+        this.showError(error.message);
+      }
+    },
+    getValue(row, column) {
+      const index = this.allColumns[column];
+      return row[index];
+    },
+    toHex(string) {
+      const bytes = new TextEncoder().encode(string);
+      return Array.from(
+        bytes,
+        byte => byte.toString(16).padStart(2, "0")
+      ).join("");
+    },
+    async parseWKB() {
+      const format = new WKB();
+      const featureOpts = {
+        dataProjection: 'EPSG:4326',
+        featureProjection: 'EPSG:3857'
+      };
+      for(const column in this.geoMetadata.columns) {
+        const index = this.allColumns[column];
+        for (const i in this.data) {
+          this.data[i][index] = format.readFeature(this.toHex(this.data[i][index]), featureOpts);
+        }
+      }
+    },
+    async addToMap() {
+      for (const row of this.data) {
+        const feature = this.getValue(row, this.geoMetadata.primary_column);
+        this.source.addFeature(feature);
+      }
+    },
+    showError(message) {
+      alert(message);
     },
     createMap() {
       this.map = new Map({
@@ -128,12 +225,12 @@ export default {
         target: 'map',
         view: new View({
           center: [0, 0],
-          zoom: 2,
-        }),
+          zoom: 2
+        })
       });
     }
   }
-}
+};
 </script>
 
 <style>
