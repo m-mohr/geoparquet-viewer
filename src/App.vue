@@ -14,12 +14,17 @@
         </tr>
         <tr v-for="(row, i) in data" :key="i">
           <td v-for="j of shownColumnsIndices" :key="`${i}_${j}`">
-            {{ row[j] }}
+            <div>{{ row[j] }}</div>
           </td>
         </tr>
       </table>
+      <template v-if="offset !== null">
+        <button @click="loadMore">Load more...</button>
+        <button @click="loadAll">Load all...</button>
+      </template>
     </section>
     <section id="map-container"><div id="map"></div></section>
+    <section id="loading" v-if="loading">Loading...</section>
   </main>
   <footer id="footer">
     <span>
@@ -53,20 +58,29 @@ const compressors = {
   snappy: snappyUncompressor()
 };
 
+function getDefaults() {
+  return {
+    data: [],
+    columns: [],
+    offset: 0,
+    pageSize: 500,
+    fileSize: null,
+    metadata: null,
+    loading: false
+  };
+}
+
 export default {
   name: 'App',
   data() {
-    return {
-      source: new VectorSource(),
-      map: null,
-      columns: [],
-      data: [],
-      url: './airports.parquet',
-      rowStart: 0,
-      rowEnd: 1000,
-      fileSize: null,
-      metadata: null
-    };
+    return Object.assign(
+      {
+        source: new VectorSource(),
+        map: null,
+        url: './airports.parquet'
+      },
+      getDefaults()
+    );
   },
   computed: {
     asyncBuffer() {
@@ -84,7 +98,7 @@ export default {
       };
     },
     geoMetadata() {
-      const geo = this.metadata?.key_value_metadata?.find(md => md.key === 'geo');
+      const geo = this.metadata?.key_value_metadata?.find((md) => md.key === 'geo');
       if (geo && geo.value) {
         return JSON.parse(geo.value);
       }
@@ -103,16 +117,14 @@ export default {
     },
     sortedColumns() {
       return Object.entries(this.allColumns)
-        .sort((a, b) => (a[1] - b[1]))
-        .map(x => ({index: x[1], name: x[0]}));
+        .sort((a, b) => a[1] - b[1])
+        .map((x) => ({ index: x[1], name: x[0] }));
     },
     shownColumns() {
-      return this.sortedColumns
-        .filter(x => !(x.name in this.geoMetadata.columns));
+      return this.sortedColumns.filter((x) => !(x.name in this.geoMetadata.columns));
     },
     shownColumnsIndices() {
-      return this.shownColumns
-        .map(x => x.index);
+      return this.shownColumns.map((x) => x.index);
     }
   },
   watch: {
@@ -122,16 +134,14 @@ export default {
   },
   mounted() {
     this.createMap();
-    this.load(this.url);
+    this.load();
   },
   methods: {
     reset() {
-      this.data = [];
-      this.columns = [];
-      this.rowStart = 0;
-      this.rowEnd = 1000;
-      this.fileSize = null;
-      this.metadata = null;
+      const defaults = getDefaults();
+      for (const key in defaults) {
+        this[key] = defaults[key];
+      }
       this.source.clear();
     },
     showLoad() {
@@ -141,7 +151,6 @@ export default {
       }
     },
     async discover() {
-      this.reset();
       try {
         const head = await fetch(this.url, { method: 'HEAD' });
         if (!head.ok) {
@@ -154,41 +163,63 @@ export default {
         this.fileSize = Number(size);
         this.metadata = await parquetMetadataAsync(this.asyncBuffer);
         if (this.columns.length === 0) {
-          this.columns = Object.keys(this.allColumns)//.filter(col => !(col in this.geoMetadata.columns));
+          this.columns = Object.keys(this.allColumns);
         }
       } catch (error) {
         this.showError(error.message);
       }
     },
     async load() {
-      await this.discover();
+      this.reset();
+      await this.loadMore();
+    },
+    async loadAll() {
+      this.pageSize = 0;
+      await this.loadMore();
+    },
+    async loadMore() {
+      if (this.offset === null) {
+        return;
+      }
+      this.loading = true;
       try {
+        if (this.fileSize === null) {
+          await this.discover();
+        }
+        const rowStart = this.offset;
+        let rowEnd = undefined;
+        if (this.pageSize) {
+          rowEnd = this.offset + this.pageSize;
+        }
         await parquetRead({
           file: this.asyncBuffer,
           metadata: this.metadata,
           compressors,
           columns: this.columns.length === 0 ? undefined : this.columns,
-          rowStart: this.rowStart,
-          rowEnd: this.rowEnd,
-          onComplete: (data) => (this.data = data)
+          rowStart,
+          rowEnd,
+          utf8: false, // Don't convert binary data as UTF-8, otherwise we can't read the WKB properly
+          onComplete: (data) => {
+            this.loading = false;
+            data.forEach((x) => this.data.push(x));
+            if (!this.pageSize || data.length < this.pageSize) {
+              this.offset = null;
+            } else {
+              this.offset += data.length;
+            }
+          }
         });
         await this.parseWKB();
         await this.addToMap();
-        console.log(this.geoMetadata);
       } catch (error) {
         this.showError(error.message);
+      } finally {
+        this.loading = false;
       }
     },
     getValue(row, column) {
       const index = this.allColumns[column];
       return row[index];
-    },
-    toHex(string) {
-      const bytes = new TextEncoder().encode(string);
-      return Array.from(
-        bytes,
-        byte => byte.toString(16).padStart(2, "0")
-      ).join("");
     },
     async parseWKB() {
       const format = new WKB();
@@ -196,10 +227,10 @@ export default {
         dataProjection: 'EPSG:4326',
         featureProjection: 'EPSG:3857'
       };
-      for(const column in this.geoMetadata.columns) {
+      for (const column in this.geoMetadata.columns) {
         const index = this.allColumns[column];
         for (const i in this.data) {
-          this.data[i][index] = format.readFeature(this.toHex(this.data[i][index]), featureOpts);
+          this.data[i][index] = format.readFeature(this.data[i][index], featureOpts);
         }
       }
     },
@@ -294,8 +325,18 @@ body,
 #table td,
 #table th {
   border: 1px solid #999;
-  padding: 0.3rem;
   font-size: 0.8rem;
+  max-width: 10rem;
+}
+#table td > div {
+  padding: 0.3rem;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 3rem;
+  overflow: auto;
+  word-wrap: break-word;
 }
 table th {
   background-color: #ccc;
@@ -306,5 +347,13 @@ table tr:nth-child(odd) {
 #map {
   width: 100%;
   height: 100%;
+}
+#loading {
+  position: absolute;
+  bottom: 1%;
+  left: 1%;
+  background-color: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  padding: 0.5rem;
 }
 </style>
