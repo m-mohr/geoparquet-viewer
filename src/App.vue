@@ -9,19 +9,23 @@
     </section>
     <section v-else id="table-container">
       <table id="table">
-        <tr>
-          <th v-for="column of shownColumns" :key="column">{{ column.name }}</th>
-        </tr>
-        <tr v-for="(row, i) in data" :key="i">
-          <td v-for="j of shownColumnsIndices" :key="`${i}_${j}`">
-            <div>{{ row[j] }}</div>
-          </td>
-        </tr>
+        <thead>
+          <tr>
+            <th v-for="column of shownColumns" :key="column">{{ column.name }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="(row, i) in data" :key="i" @click="selectOnMap(i)" :id="`row${i}`" :class="{highlight: i === selected}">
+            <td v-for="j of shownColumnsIndices" :key="`${i}_${j}`">
+              <div>{{ row[j] }}</div>
+            </td>
+          </tr>
+        </tbody>
       </table>
-      <template v-if="offset !== null">
-        <button @click="loadMore">Load more...</button>
+      <div v-if="offset !== null" class="loadmore">
+        <button @click="loadMore">Load more...</button>&nbsp;
         <button @click="loadAll">Load all...</button>
-      </template>
+      </div>
     </section>
     <section id="map-container"><div id="map"></div></section>
     <section id="loading" v-if="loading">Loading...</section>
@@ -46,7 +50,9 @@ import { snappyUncompressor } from 'hysnappy';
 import WKB from 'ol/format/WKB.js';
 import Map from 'ol/Map.js';
 import View from 'ol/View.js';
+import Select from 'ol/interaction/Select.js';
 import { OSM, Vector as VectorSource } from 'ol/source.js';
+import { Circle, Fill, Stroke, Style } from 'ol/style.js';
 import { Tile as TileLayer, Vector as VectorLayer } from 'ol/layer.js';
 import proj4 from 'proj4';
 import { register } from 'ol/proj/proj4.js';
@@ -66,9 +72,29 @@ function getDefaults() {
     pageSize: 500,
     fileSize: null,
     metadata: null,
-    loading: false
+    loading: false,
+    selected: null
   };
 }
+
+function getStyle(color = '#3399CC') {
+  const fill = new Fill({
+    color: 'rgba(255,255,255,0.4)'
+  });
+  const stroke = new Stroke({
+    color,
+    width: 1.25
+  });
+  return new Style({
+    image: new Circle({
+      fill: fill,
+      stroke: stroke,
+      radius: 5
+    }),
+    fill: fill,
+    stroke: stroke
+  });
+};
 
 export default {
   name: 'App',
@@ -77,7 +103,9 @@ export default {
       {
         source: new VectorSource(),
         map: null,
-        url: './airports.parquet'
+        url: './airports.parquet',
+        defaultStyle: getStyle(),
+        selectStyle: getStyle('#FF0000'),
       },
       getDefaults()
     );
@@ -137,6 +165,34 @@ export default {
     this.load();
   },
   methods: {
+    unselectFeature() {
+      if (this.selected === null) {
+        return;
+      }
+      this.setFeatureStyle(this.selected, this.defaultStyle);
+    },
+    selectFeature() {
+      const feature = this.setFeatureStyle(this.selected, this.selectStyle);
+      const extent = feature.getGeometry().getExtent();
+      this.map.getView().fit(extent, { minResolution: 1000 });
+    },
+    setFeatureStyle(id, style) {
+      const feature = this.source.getFeatureById(id);
+      feature.setStyle(style);
+      return feature;
+    },
+    select(i) {
+      this.unselectFeature();
+      this.selected = i;
+    },
+    selectOnMap(i) {
+      this.select(i);
+      this.selectFeature('#FF0000');
+    },
+    selectInTable(i) {
+      this.select(i);
+      document.getElementById(`row${i}`).scrollIntoView();
+    },
     reset() {
       const defaults = getDefaults();
       for (const key in defaults) {
@@ -230,7 +286,9 @@ export default {
       for (const column in this.geoMetadata.columns) {
         const index = this.allColumns[column];
         for (const i in this.data) {
-          this.data[i][index] = format.readFeature(this.data[i][index], featureOpts);
+          const feature = format.readFeature(this.data[i][index], featureOpts);
+          feature.setId(i);
+          this.data[i][index] = feature;
         }
       }
     },
@@ -244,6 +302,8 @@ export default {
       alert(message);
     },
     createMap() {
+      const select = new Select({ style: this.selectStyle });
+      select.on('select', (e) => this.selectInTable(parseInt(e.selected[0].getId(), 10)));
       this.map = new Map({
         layers: [
           new TileLayer({
@@ -259,6 +319,7 @@ export default {
           zoom: 2
         })
       });
+      this.map.addInteraction(select);
     }
   }
 };
@@ -320,11 +381,19 @@ body,
 }
 #table {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+#table thead {
+  position: sticky;
+  top: 0;
+  box-shadow: 0 2px 2px -1px rgba(0, 0, 0, 0.4);
 }
 #table td,
 #table th {
-  border: 1px solid #999;
+  border-width: 0 1px 1px 0;
+  border-color: #555;
+  border-style: solid;
   font-size: 0.8rem;
   max-width: 10rem;
 }
@@ -338,8 +407,12 @@ body,
   overflow: auto;
   word-wrap: break-word;
 }
+#table tr.highlight {
+  background-color: #ff9999;
+}
 table th {
   background-color: #ccc;
+  padding: 0.3rem;
 }
 table tr:nth-child(odd) {
   background-color: #f2f2f2;
@@ -354,6 +427,10 @@ table tr:nth-child(odd) {
   left: 1%;
   background-color: rgba(0, 0, 0, 0.5);
   color: #fff;
+  padding: 0.5rem;
+}
+.loadmore {
+  text-align: center;
   padding: 0.5rem;
 }
 </style>
