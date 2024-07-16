@@ -15,7 +15,13 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(row, i) in data" :key="i" @click="selectOnMap(i)" :id="`row${i}`" :class="{highlight: i === selected}">
+          <tr
+            v-for="(row, i) in data"
+            :key="i"
+            @click="selectOnMap(i)"
+            :id="`row${i}`"
+            :class="{ highlight: i === selected }"
+          >
             <td v-for="j of shownColumnsIndices" :key="`${i}_${j}`">
               <div>{{ row[j] }}</div>
             </td>
@@ -94,7 +100,7 @@ function getStyle(color = '#3399CC') {
     fill: fill,
     stroke: stroke
   });
-};
+}
 
 export default {
   name: 'App',
@@ -105,7 +111,7 @@ export default {
         map: null,
         url: './airports.parquet',
         defaultStyle: getStyle(),
-        selectStyle: getStyle('#FF0000'),
+        selectStyle: getStyle('#FF0000')
       },
       getDefaults()
     );
