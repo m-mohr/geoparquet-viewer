@@ -113,9 +113,16 @@ function getDefaults() {
 }
 
 function getDefaultUrl() {
-  const relPath = './airports.parquet';
-  const absPath = new URL(relPath, window.location.href);
-  return absPath.toString();
+  const urlParams = new URLSearchParams(window.location.search);
+  const url = urlParams.get('url');
+  if (url) {
+    return url;
+  }
+  else {
+    const relPath = './airports.parquet';
+    const absPath = new URL(relPath, window.location.href);
+    return absPath.toString();
+  }
 }
 
 export default {
@@ -207,6 +214,7 @@ export default {
   },
   watch: {
     url() {
+      history.pushState({}, '', `?url=${this.url}`);
       this.load();
     }
   },
