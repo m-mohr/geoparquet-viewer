@@ -197,7 +197,7 @@ export default {
     },
     selectInTable(i) {
       this.select(i);
-      document.getElementById(`row${i}`).scrollIntoView();
+      document.getElementById(`row${i}`).scrollIntoView({ block: 'center' });
     },
     reset() {
       const defaults = getDefaults();
