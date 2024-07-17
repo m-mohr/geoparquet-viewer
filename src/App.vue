@@ -10,15 +10,13 @@
         <span class="title">
           <code>{{ this.url }}</code>
           &nbsp;
-          <span class="counts" v-if="!loading"
-            >(
-            <template v-if="offset !== null">{{ offset }}/</template>
-            <template v-if="numRows >= 0">{{ numRows }}</template>
+          <span class="counts">(
+            {{ loadedNumRows }} /
+            <template v-if="totalNumRows >= 0">{{ totalNumRows }}</template>
             <template v-else>?</template>
             rows
-            <button v-if="offset !== null" @click="loadMore">Load more...</button>
-            )</span
-          >
+            <button v-if="!loading && !isComplete" @click="loadMore">Load more...</button>
+          )</span>
         </span>
         <button v-if="metadata" @click="showMetadata">Parquet Metadata</button>
         <button v-if="geoMetadata" @click="showGeoMetadata">GeoParquet Metadata</button>
@@ -33,24 +31,24 @@
         <table id="table">
           <thead>
             <tr>
-              <th v-for="column of shownColumns" :key="column">{{ column.name }}</th>
+              <th v-for="column of shownColumns" :key="column">{{ column }}</th>
             </tr>
           </thead>
           <tbody>
             <tr
-              v-for="(row, i) in data"
+              v-for="i of rowIndices"
               :key="i"
               @click="selectOnMap(i)"
-              :id="`row${i}`"
+              :id="`row_${i}`"
               :class="{ highlight: i === selected }"
             >
-              <td v-for="j of shownColumnsIndices" :key="`${i}_${j}`">
-                <div>{{ row[j] }}</div>
+              <td v-for="column of shownColumns" :key="`cell_${column}_${i}`">
+                <div>{{ data[column][i] }}</div>
               </td>
             </tr>
           </tbody>
         </table>
-        <div v-if="offset !== null" class="loadmore">
+        <div v-if="!loading && !isComplete" class="loadmore">
           <button @click="loadMore">Load more...</button>&nbsp;
           <button @click="loadAll">Load all...</button>
         </div>
@@ -92,19 +90,20 @@ import AboutModal from './components/modals/AboutModal.vue';
 import LoadDataModal from './components/modals/LoadDataModal.vue';
 import MetadataModal from './components/modals/MetadataModal.vue';
 
-register(proj4); // required to support reprojection
-
 const compressors = {
   ...hycompressors,
   snappy: snappyUncompressor()
 };
 
+// Todo: Ugly hack to change the default rendering of Date objects
+Date.prototype.toString = Date.prototype.toISOString
+
 function getDefaults() {
   return {
-    data: [],
+    data: {},
     columns: [],
     offset: 0,
-    pageSize: 500,
+    pageSize: 100,
     fileSize: null,
     metadata: null,
     loading: false,
@@ -154,8 +153,21 @@ export default {
         }
       };
     },
-    numRows() {
+    loadedNumRows() {
+      const keys = Object.keys(this.data);
+      if (keys.length > 0 && Array.isArray(this.data[keys[0]])) {
+        return this.data[keys[0]].length;
+      }
+      return 0;
+    },
+    rowIndices() {
+      return Array.from({ length: this.loadedNumRows }, (_, i) => i);
+    },
+    totalNumRows() {
       return this.metadata?.num_rows;
+    },
+    isComplete() {
+      return this.loadedNumRows >= 0 && this.loadedNumRows >= this.totalNumRows;
     },
     geoMetadata() {
       const geo = this.metadata?.key_value_metadata?.find((md) => md.key === 'geo');
@@ -164,27 +176,33 @@ export default {
       }
       return null;
     },
-    schema() {
-      return parquetSchema(this.metadata);
-    },
-    allColumns() {
-      const map = {};
-      for (const index in this.schema.children) {
-        const child = this.schema.children[index];
-        map[child.element.name] = parseInt(index, 10);
+    primaryGeoColumn() {
+      if (this.geoMetadata) {
+        return this.geoMetadata.columns[this.geoMetadata.primary_column];
       }
-      return map;
+      return {};
     },
-    sortedColumns() {
-      return Object.entries(this.allColumns)
-        .sort((a, b) => a[1] - b[1])
-        .map((x) => ({ index: x[1], name: x[0] }));
+    schema() {
+      if (this.metadata) {
+        return parquetSchema(this.metadata);
+      }
+      return null;
+    },
+    columnsInSchema() {
+      if (this.schema) {
+        return this.schema.children.map(child => child.element.name);
+      }
+      return [];
     },
     shownColumns() {
-      return this.sortedColumns.filter((x) => !(x.name in this.geoMetadata.columns));
+      return this.columns.filter((column) => !(column in this.geoMetadata.columns));
     },
-    shownColumnsIndices() {
-      return this.shownColumns.map((x) => x.index);
+    crs() {
+      const crs = this.primaryGeoColumn.crs;
+      if (crs && crs.id) {
+        return `${crs.id.authority}:${crs.id.code}`;
+      }
+      return 'EPSG:4326';
     }
   },
   watch: {
@@ -239,12 +257,26 @@ export default {
       this.setFeatureStyle(this.selected, this.defaultStyle);
     },
     selectFeature() {
+      if (this.selected === null) {
+        return;
+      }
       const feature = this.setFeatureStyle(this.selected, this.selectStyle);
-      const extent = feature.getGeometry().getExtent();
-      this.map.getView().fit(extent, { minResolution: 1000 });
+      const geometry = feature.getGeometry();
+      const type = geometry.getType();
+      let fitOpts;
+      if (type === 'Point') {
+        fitOpts = { minResolution: 1000 };
+      }
+      else {
+        fitOpts = { padding: [100, 100, 100, 100] };
+      }
+      this.map.getView().fit(geometry.getExtent(), fitOpts);
     },
     setFeatureStyle(id, style) {
       const feature = this.source.getFeatureById(id);
+      if (!feature) {
+        return;
+      }
       feature.setStyle(style);
       return feature;
     },
@@ -258,7 +290,7 @@ export default {
     },
     selectInTable(i) {
       this.select(i);
-      document.getElementById(`row${i}`).scrollIntoView({ block: 'center' });
+      document.getElementById(`row_${i}`).scrollIntoView({ block: 'center' });
     },
     reset() {
       const defaults = getDefaults();
@@ -280,7 +312,7 @@ export default {
         this.fileSize = Number(size);
         this.metadata = await parquetMetadataAsync(this.asyncBuffer);
         if (this.columns.length === 0) {
-          this.columns = Object.keys(this.allColumns);
+          this.columns = this.columnsInSchema;
         }
       } catch (error) {
         this.showError(error.message);
@@ -295,7 +327,7 @@ export default {
       await this.loadMore();
     },
     async loadMore() {
-      if (this.offset === null) {
+      if (this.isComplete) {
         return;
       }
       this.loading = true;
@@ -308,6 +340,11 @@ export default {
         if (this.pageSize) {
           rowEnd = this.offset + this.pageSize;
         }
+        this.columnsInSchema.forEach((column) => {
+          if (!Array.isArray(this.data[column])) {
+            this.data[column] = [];
+          }
+        });
         await parquetRead({
           file: this.asyncBuffer,
           metadata: this.metadata,
@@ -316,48 +353,60 @@ export default {
           rowStart,
           rowEnd,
           utf8: false, // Don't convert binary data as UTF-8, otherwise we can't read the WKB properly
-          onComplete: (data) => {
-            this.loading = false;
-            data.forEach((x) => this.data.push(x));
-            if (!this.pageSize || data.length < this.pageSize) {
-              this.offset = null;
-            } else {
-              this.offset += data.length;
+          onChunk: ({columnName, columnData}) => {
+            if (this.pageSize) {
+              columnData = columnData.slice(0, this.pageSize);
             }
+            // todo: check what is faster:
+            columnData.forEach((x) => this.data[columnName].push(x));
+            // this.data[columnName] = this.data[columnName].concat(data);
           }
         });
+        this.offset += this.pageSize;
         await this.parseWKB();
         await this.addToMap();
+        this.selectFeature();
       } catch (error) {
         this.showError(error.message);
       } finally {
         this.loading = false;
       }
     },
-    getValue(row, column) {
-      const index = this.allColumns[column];
-      return row[index];
+    async loadProj(code) {
+      if (proj4.defs(code)) {
+        return;
+      }
+      try {
+        const path = code.toLowerCase().replace(':', '/');
+        const response = await fetch(`https://spatialreference.org/ref/${path}/ogcwkt/`);
+        const wkt = await response.text();
+        proj4.defs(code, wkt);
+        register(proj4);
+        return proj4.defs(code);
+      } catch (error) {
+        this.showError(`Failed to load projection ${code}: ${error.message}`);
+      }
     },
     async parseWKB() {
       const format = new WKB();
+      await this.loadProj(this.crs);
       const featureOpts = {
-        dataProjection: 'EPSG:4326',
+        dataProjection: this.crs,
         featureProjection: 'EPSG:3857'
       };
       for (const column in this.geoMetadata.columns) {
-        const index = this.allColumns[column];
-        for (const i in this.data) {
-          const feature = format.readFeature(this.data[i][index], featureOpts);
+        for (const i in this.data[column]) {
+          const feature = format.readFeature(this.data[column][i], featureOpts);
           feature.setId(i);
-          this.data[i][index] = feature;
+          this.data[column][i] = feature;
         }
       }
     },
     async addToMap() {
-      for (const row of this.data) {
-        const feature = this.getValue(row, this.geoMetadata.primary_column);
+      for (const feature of this.data[this.geoMetadata.primary_column]) {
         this.source.addFeature(feature);
       }
+      this.map.getView().fit(this.source.getExtent());
     },
     showError(message) {
       alert(message);
