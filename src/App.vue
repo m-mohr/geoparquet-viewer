@@ -1,55 +1,76 @@
 <template>
-  <header id="header">
-    <h1>GeoParquet Viewer</h1>
-    <button @click="showLoad">Load Data</button>
-  </header>
-  <main id="main">
-    <section v-if="data.length === 0" id="error-container">
-      <p>No data available!</p>
-    </section>
-    <section v-else id="table-container">
-      <table id="table">
-        <thead>
-          <tr>
-            <th v-for="column of shownColumns" :key="column">{{ column.name }}</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr
-            v-for="(row, i) in data"
-            :key="i"
-            @click="selectOnMap(i)"
-            :id="`row${i}`"
-            :class="{ highlight: i === selected }"
-          >
-            <td v-for="j of shownColumnsIndices" :key="`${i}_${j}`">
-              <div>{{ row[j] }}</div>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <div v-if="offset !== null" class="loadmore">
-        <button @click="loadMore">Load more...</button>&nbsp;
-        <button @click="loadAll">Load all...</button>
+  <div id="viewer">
+    <header id="header">
+      <div class="row">
+        <h1 class="title">GeoParquet Viewer</h1>
+        <button @click="showLoad">Load Data</button>
+        <button @click="showAbout">About</button>
       </div>
-    </section>
-    <section id="map-container"><div id="map"></div></section>
-    <section id="loading" v-if="loading">Loading...</section>
-  </main>
-  <footer id="footer">
-    <span>
-      Powered by
-      <a href="https://vuejs.org" target="_blank">Vue</a>,
-      <a href="https://openlayers.org" target="_blank">OpenLayers</a>, and
-      <a href="https://github.com/hyparam/hyparquet" target="_blank">hyparquet</a>
-    </span>
-    <span>Hosted by <a href="https://github.com" target="_blank">GitHub</a></span>
-    <span>Assembled by <a href="https://mohr.ws" target="_blank">Matthias Mohr</a></span>
-  </footer>
+      <div class="row subheader">
+        <span class="title">
+          <code>{{ this.url }}</code>
+          &nbsp;
+          <span class="counts" v-if="!loading"
+            >(
+            <template v-if="offset !== null">{{ offset }}/</template>
+            <template v-if="numRows >= 0">{{ numRows }}</template>
+            <template v-else>?</template>
+            rows
+            <button v-if="offset !== null" @click="loadMore">Load more...</button>
+            )</span
+          >
+        </span>
+        <button v-if="metadata" @click="showMetadata">Parquet Metadata</button>
+        <button v-if="geoMetadata" @click="showGeoMetadata">GeoParquet Metadata</button>
+      </div>
+    </header>
+    <main id="main">
+      <section v-if="data.length === 0" id="error-container">
+        <p v-if="loading">Data is loading...</p>
+        <p v-else>No data available!</p>
+      </section>
+      <section v-else id="table-container">
+        <table id="table">
+          <thead>
+            <tr>
+              <th v-for="column of shownColumns" :key="column">{{ column.name }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="(row, i) in data"
+              :key="i"
+              @click="selectOnMap(i)"
+              :id="`row${i}`"
+              :class="{ highlight: i === selected }"
+            >
+              <td v-for="j of shownColumnsIndices" :key="`${i}_${j}`">
+                <div>{{ row[j] }}</div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="offset !== null" class="loadmore">
+          <button @click="loadMore">Load more...</button>&nbsp;
+          <button @click="loadAll">Load all...</button>
+        </div>
+      </section>
+      <section id="map-container"><div id="map"></div></section>
+    </main>
+    <template v-for="modal in modals" :key="modal.id">
+      <component
+        :is="modal.component"
+        v-bind="modal.props"
+        v-on="modal.events"
+        @close="hideModal(modal)"
+      />
+    </template>
+    <span v-if="loading" id="loading"><Spinner /></span>
+  </div>
 </template>
 
 <script>
-import { parquetRead, parquetMetadataAsync, parquetSchema } from 'hyparquet';
+import { parquetRead, parquetMetadataAsync, parquetSchema, toJson } from 'hyparquet';
 import { compressors as hycompressors } from 'hyparquet-compressors';
 import { snappyUncompressor } from 'hysnappy';
 
@@ -58,10 +79,18 @@ import Map from 'ol/Map.js';
 import View from 'ol/View.js';
 import Select from 'ol/interaction/Select.js';
 import { OSM, Vector as VectorSource } from 'ol/source.js';
-import { Circle, Fill, Stroke, Style } from 'ol/style.js';
 import { Tile as TileLayer, Vector as VectorLayer } from 'ol/layer.js';
 import proj4 from 'proj4';
 import { register } from 'ol/proj/proj4.js';
+import { getStyle } from './map.js';
+
+import Utils from './utils.js';
+
+import Spinner from './components/Spinner.vue';
+
+import AboutModal from './components/modals/AboutModal.vue';
+import LoadDataModal from './components/modals/LoadDataModal.vue';
+import MetadataModal from './components/modals/MetadataModal.vue';
 
 register(proj4); // required to support reprojection
 
@@ -79,37 +108,31 @@ function getDefaults() {
     fileSize: null,
     metadata: null,
     loading: false,
-    selected: null
+    selected: null,
+    modals: []
   };
 }
 
-function getStyle(color = '#3399CC') {
-  const fill = new Fill({
-    color: 'rgba(255,255,255,0.4)'
-  });
-  const stroke = new Stroke({
-    color,
-    width: 1.25
-  });
-  return new Style({
-    image: new Circle({
-      fill: fill,
-      stroke: stroke,
-      radius: 5
-    }),
-    fill: fill,
-    stroke: stroke
-  });
+function getDefaultUrl() {
+  const relPath = './airports.parquet';
+  const absPath = new URL(relPath, window.location.href);
+  return absPath.toString();
 }
 
 export default {
   name: 'App',
+  components: {
+    AboutModal,
+    LoadDataModal,
+    MetadataModal,
+    Spinner
+  },
   data() {
     return Object.assign(
       {
         source: new VectorSource(),
         map: null,
-        url: './airports.parquet',
+        url: getDefaultUrl(),
         defaultStyle: getStyle(),
         selectStyle: getStyle('#FF0000')
       },
@@ -130,6 +153,9 @@ export default {
           return res.arrayBuffer();
         }
       };
+    },
+    numRows() {
+      return this.metadata?.num_rows;
     },
     geoMetadata() {
       const geo = this.metadata?.key_value_metadata?.find((md) => md.key === 'geo');
@@ -171,6 +197,41 @@ export default {
     this.load();
   },
   methods: {
+    showModal(component, props = {}, events = {}, id = null) {
+      this.modals.push({
+        component,
+        props,
+        events,
+        id: id || 'modal_' + Date.now()
+      });
+    },
+    hideModal(modal) {
+      let id = Utils.isObject(modal) ? modal.id : modal;
+      let index = this.modals.findIndex((other) => other.id === id);
+      if (typeof index !== 'undefined') {
+        this.modals.splice(index, 1);
+      }
+    },
+    showAbout() {
+      this.showModal('AboutModal');
+    },
+    showLoad() {
+      this.showModal(
+        'LoadDataModal',
+        { url: this.url },
+        {
+          save: (url) => {
+            this.url = url;
+          }
+        }
+      );
+    },
+    showGeoMetadata() {
+      this.showModal('MetadataModal', { data: this.geoMetadata });
+    },
+    showMetadata() {
+      this.showModal('MetadataModal', { data: toJson(this.metadata) });
+    },
     unselectFeature() {
       if (this.selected === null) {
         return;
@@ -205,12 +266,6 @@ export default {
         this[key] = defaults[key];
       }
       this.source.clear();
-    },
-    showLoad() {
-      const url = prompt('Enter GeoParquet file to load:', this.url);
-      if (url) {
-        this.url = url;
-      }
     },
     async discover() {
       try {
@@ -331,43 +386,53 @@ export default {
 };
 </script>
 
-<style>
+<style lang="scss">
 @import url('../node_modules/ol/ol.css');
+
 html,
 body,
-#app {
+#app,
+#viewer {
   height: 100%;
   margin: 0;
   padding: 0;
   font-family: sans-serif;
 }
-#header,
-#footer {
-  height: 2rem;
+
+#header {
+  height: 4rem;
   background-color: #333;
   color: #fff;
-  box-sizing: border-box;
-  display: flex;
-  align-items: center;
-  padding: 0 0.5rem;
+
+  .row {
+    height: 2rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0 0.5rem;
+    box-sizing: border-box;
+
+    .title {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex-grow: 1;
+    }
+    button {
+      white-space: nowrap;
+    }
+    h1 {
+      font-size: 1.2rem;
+    }
+  }
+
+  .subheader {
+    background-color: #777;
+  }
 }
-#header {
-  gap: 1rem;
-}
-#footer {
-  justify-content: center;
-  gap: 2rem;
-}
-#header h1 {
-  margin: 0;
-  padding: 0;
-  font-size: 1.2rem;
-  flex-grow: 1;
-}
-#header a,
-#footer a {
-  color: #fff;
-}
+
 #main {
   height: calc(100% - 4rem);
 }
@@ -389,54 +454,85 @@ body,
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
+
+  thead {
+    position: sticky;
+    top: 0;
+    box-shadow: 0 2px 2px -1px rgba(0, 0, 0, 0.4);
+  }
+
+  tr {
+    &:nth-child(odd) {
+      background-color: #f2f2f2;
+    }
+    &.highlight {
+      background-color: #ff9999 !important;
+    }
+  }
+
+  td,
+  th {
+    border-width: 0 1px 1px 0;
+    border-color: #555;
+    border-style: solid;
+    font-size: 0.8rem;
+    max-width: 10rem;
+  }
+
+  th {
+    background-color: #ccc;
+    padding: 0.3rem;
+  }
+
+  td > div {
+    padding: 0.3rem;
+    box-sizing: border-box;
+    width: 100%;
+    height: 100%;
+    max-width: 100%;
+    max-height: 3rem;
+    overflow: auto;
+    word-wrap: break-word;
+  }
 }
-#table thead {
-  position: sticky;
-  top: 0;
-  box-shadow: 0 2px 2px -1px rgba(0, 0, 0, 0.4);
-}
-#table td,
-#table th {
-  border-width: 0 1px 1px 0;
-  border-color: #555;
-  border-style: solid;
-  font-size: 0.8rem;
-  max-width: 10rem;
-}
-#table td > div {
-  padding: 0.3rem;
-  box-sizing: border-box;
-  width: 100%;
-  height: 100%;
-  max-width: 100%;
-  max-height: 3rem;
-  overflow: auto;
-  word-wrap: break-word;
-}
-#table tr.highlight {
-  background-color: #ff9999;
-}
-table th {
-  background-color: #ccc;
-  padding: 0.3rem;
-}
-table tr:nth-child(odd) {
-  background-color: #f2f2f2;
+form {
+  .row {
+    display: flex;
+    margin: 0.25em 0;
+  }
+  label {
+    width: 30%;
+    display: flex;
+    align-items: center;
+  }
+  .input {
+    flex-grow: 1;
+    display: flex;
+  }
+  .input input {
+    flex-grow: 1;
+  }
+  input {
+    padding: 0.3em;
+  }
+  input,
+  button {
+    margin: 3px;
+  }
 }
 #map {
   width: 100%;
   height: 100%;
 }
-#loading {
-  position: absolute;
-  bottom: 1%;
-  left: 1%;
-  background-color: rgba(0, 0, 0, 0.5);
-  color: #fff;
-  padding: 0.5rem;
-}
 .loadmore {
   text-align: center;
   padding: 0.5rem;
+}
+#loading {
+  position: absolute;
+  bottom: 1rem;
+  left: 1rem;
+  width: 5rem;
+  height: 5rem;
 }
 </style>
